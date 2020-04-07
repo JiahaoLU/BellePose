@@ -1,0 +1,8 @@
+tqdm
+torch
+torchvision
+pandas
+scipy
+numpy==1.18.0
+scikit-image==0.16.2
+opencv-python==4.2.0.32
