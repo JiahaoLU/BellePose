@@ -82,9 +82,9 @@ def picklize_annotations():
         pickle.dump(df, pklfile)
 
 
-def reload_anno_pickle() -> pd.DataFrame:
+def reload_anno_pickle(dir) -> pd.DataFrame:
     try:
-        with open(ANNO_SAV_DIR, 'rb') as pklf:
+        with open(dir, 'rb') as pklf:
             annos = pickle.load(pklf)
             print('pickle file reload from %s' % ANNO_SAV_DIR)
             print(annos.head(5))
