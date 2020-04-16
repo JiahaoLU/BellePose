@@ -42,6 +42,7 @@ class MPIIDataset(Dataset):
         :return:
         """
         anno = self.annotations.iloc[index]
+        fn = anno['filename']
         joints = self.get_joints_array(anno)
         bbox_w, bbox_h = self.calc_joint_bbox_size(joints)
         cx, cy = self.calc_joint_center(joints)
@@ -49,13 +50,13 @@ class MPIIDataset(Dataset):
 
         image, joints = self.crop_reshape(image, joints, bbox_w, bbox_h, cx, cy)
         image = image.astype(np.uint8)
-        image = rgb2gray(image)
-        image = low_pass_filter(enhance_contrast(image))
-        image = enhance_contrast(gradient(image, -1))
+        # image = rgb2gray(image)
+        image = enhance_contrast(image)
+        # image = enhance_contrast(gradient(image, -1))
         image = transform_to_tensor(image, self.input_size)
         headsize = self.get_headsize(joints[0:2, :])
         joints = joints[2:, :].astype(np.uint8).reshape(-1)
-        return image, joints, int(headsize)
+        return image, joints, int(headsize), fn
 
     def get_njoints(self):
         """
@@ -110,6 +111,7 @@ class MPIIDataset(Dataset):
 
 if __name__ == "__main__":
     ds = MPIIDataset(256)
+    print(len(ds))
     IMG, ANNO, h = ds[0]
     print(h)
     ANNO_offset = ANNO + 0.1 * min(calc_bbox_size(ANNO)) / 4 / 1.414

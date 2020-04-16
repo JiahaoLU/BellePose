@@ -54,7 +54,6 @@ def show_img(img: T, joints: List[np.ndarray] = [], include_joints: bool = False
     if is_colorful(img):
         if type(img) == torch.Tensor:
             img = img.permute(1, 2, 0)
-
             plt.imshow(img)
         else:
             plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
@@ -76,13 +75,13 @@ def show_img(img: T, joints: List[np.ndarray] = [], include_joints: bool = False
             j = j.astype(np.uint8).reshape(-1, 2)
             plt.scatter(np.clip(j[:, 0], 0, size_limit), np.clip(j[:, 1], 0, size_limit),
                         c=COLOR_MAP[i % 8], label='joint ' + str(i))
-    plt.legend()
+        plt.legend()
     plt.show()
 
 
-def enhance_contrast(img: np.ndarray, method='clahe') -> np.ndarray:
+def enhance_contrast(img: np.ndarray, method='equalize') -> np.ndarray:
     if method == 'log':
-        return exposure.adjust_log(img, gain=2)
+        return exposure.adjust_log(img)
     elif method == 'clahe':
         if is_colorful(img):
             l, a, b = cv2.split(cv2.cvtColor(img, cv2.COLOR_BGR2LAB))
@@ -96,7 +95,9 @@ def enhance_contrast(img: np.ndarray, method='clahe') -> np.ndarray:
             raise ValueError('Input is not an image.')
     elif method == 'equalize':
         if is_colorful(img):
-            return cv2.equalizeHist(img)
+            yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YUV)
+            yuv[:, :, 0] = cv2.equalizeHist(yuv[:, :, 0])
+            return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
         elif is_gray(img):
             return cv2.equalizeHist(img)
         else:
@@ -111,9 +112,79 @@ def gradient(img: np.ndarray, axis: int = -1, kernel: int = 5) -> np.ndarray:
     if axis not in [0, -1, 1]:
         raise ValueError("need right code for axis.")
     if axis == -1:
-        return cv2.Laplacian(img, cv2.CV_8U, ksize=kernel)
+        L = cv2.Laplacian(img, cv2.CV_8U, ksize=kernel)
+        return cv2.threshold(L, 127, 255, 0)[1]
     elif axis >= 0:  # 0: x, 1: y
         return cv2.Sobel(img, cv2.CV_8U, 1 - axis, axis, ksize=kernel)
+
+
+def laplace_contour(img, lb=64, do_box=True, btype='bbox'):
+    imgray = rgb2gray(img)
+    thresh = gradient(imgray, -1)
+    # _, thresh = cv2.threshold(imgray, 127,255,0)
+    contours, hier = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if do_box:
+        cnt_draw = draw_bbox(img, contours, btype)
+    else:
+        cnt_draw = draw_approx_hull_polygon(img, contours, btype)
+    return cnt_draw
+
+
+def canny_contour(img, lb=64, do_box=True, btype='bbox'):
+    imgray = rgb2gray(img)
+    thresh = cv2.Canny(imgray, lb, 256)
+    # _, thresh = cv2.threshold(imgray, 127,255,0)
+    contours, hier = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if do_box:
+        cnt_draw = draw_bbox(img, contours, btype)
+    else:
+        try:
+            cnt_draw = draw_approx_hull_polygon(img, contours, btype=btype)
+        except:
+            cnt_draw = draw_approx_hull_polygon(img, contours)
+    # return thresh
+    return cnt_draw
+
+
+def draw_approx_hull_polygon(img, cnts, btype='approx'):
+    # img = np.copy(img)
+    drawing = np.copy(img)
+    if btype == 'contour':
+        cv2.drawContours(drawing, cnts, -1, (255, 0, 0), 3)  # blue
+    elif btype == 'approx':
+        epsilion = drawing.shape[0] / 32
+        approxes = [cv2.approxPolyDP(cnt, epsilion, True) for cnt in cnts]
+        cv2.polylines(drawing, approxes, True, (0, 255, 0), 2)  # green
+    elif btype == 'hull':
+        hulls = [cv2.convexHull(cnt) for cnt in cnts]
+        cv2.polylines(drawing, hulls, True, (0, 0, 255), 2)  # red
+    else:
+        raise ValueError('Box type not existed')
+    return cv2.cvtColor(drawing, cv2.COLOR_BGR2RGB)
+
+
+def draw_bbox(image, cnts, btype='bbox', min_frac: float = 0.1):  # conts = contours
+    min_size = float(min(image.shape[0], image.shape[1]) * min_frac)
+    box = np.copy(image)
+
+    if btype == 'bbox':
+        for cnt in cnts:
+            x, y, w, h = cv2.boundingRect(cnt)
+            if max(w, h) > min_size:
+                cv2.rectangle(box, (x, y), (x + w, y + h), (255, 0, 0), 2)  # blue
+    elif btype == 'minbox':
+        for cnt in cnts:
+            min_rect = cv2.minAreaRect(cnt)  # min_area_rectangle
+            min_rect = np.int0(cv2.boxPoints(min_rect))
+            cv2.drawContours(box, [min_rect], 0, (0, 255, 0), 2)  # green
+    elif btype == 'circle':
+        for cnt in cnts:
+            (x, y), radius = cv2.minEnclosingCircle(cnt)
+            center, radius = (int(x), int(y)), int(radius)  # for the minimum enclosing circle
+            box = cv2.circle(box, center, radius, (0, 0, 255), 2)  # red
+    else:
+        raise ValueError('Box type not existed')
+    return cv2.cvtColor(box, cv2.COLOR_BGR2RGB)
 
 
 def low_pass_filter(img: np.ndarray, kernel: int = 5) -> np.ndarray:
@@ -137,34 +208,47 @@ def transform_to_tensor(mat: np.ndarray, input_size) -> torch.Tensor:
         transforms.Resize(input_size),
         # transforms.CenterCrop(224),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5], std=[0.5])
-        # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        # transforms.Normalize(mean=[0.5], std=[0.5])
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
     return process(pilimg)
 
 
 if __name__ == '__main__':
-    img = rgb2gray(load_img('000156511.jpg'))
-    img =low_pass_filter(enhance_contrast(img))
-    img2 = low_pass_filter(enhance_contrast(img), kernel=3)
-    laplacian = enhance_contrast(gradient(img, -1))
-    laplacian2 = enhance_contrast(gradient(img2, -1))
-    # sobelx = enhance_contrast(gradient(img, 0))
-    # sobely = enhance_contrast(gradient(img, 1))
+    img_color = load_img('000337885.jpg')
+    pic = rgb2gray(img_color)
+    # pic =low_pass_filter(enhance_contrast(pic))
+    # img2 = low_pass_filter(enhance_contrast(pic), kernel=3)
 
-    plt.subplot(2, 2, 1), plt.imshow(img, cmap='gray')
+    laplacian = enhance_contrast(gradient(pic, -1))
+    # sobelx = enhance_contrast(gradient(pic, 0))
+    canbox = canny_contour(img_color, 50)
+    cancon = canny_contour(img_color, 50, do_box=False)
+    plt.subplot(2, 2, 1), plt.imshow(canny_contour(img_color,50,do_box=False, btype='contour'), cmap='gray',  )
     plt.title('Original'), plt.xticks([]), plt.yticks([])
-    plt.subplot(2, 2, 2), plt.imshow(laplacian, cmap='gray')
-    plt.title('Laplacian k = 5'), plt.xticks([]), plt.yticks([])
-    plt.subplot(2, 2, 3), plt.imshow(laplacian2, cmap='gray')
-    plt.title('Laplacian k = 3'), plt.xticks([]), plt.yticks([])
-    plt.subplot(2, 2, 4), plt.imshow(transform_to_tensor(laplacian), cmap='gray')
-    plt.title('resize'), plt.xticks([]), plt.yticks([])
+    plt.subplot(2, 2, 2), plt.imshow(canbox, cmap='gray')
+    plt.title('Box'), plt.xticks([]), plt.yticks([])
+    plt.subplot(2, 2, 3), plt.imshow(laplace_contour(img_color), cmap='gray')
+    plt.title('Box by Laplacian'), plt.xticks([]), plt.yticks([])
+    plt.subplot(2, 2, 4), plt.imshow(cancon, cmap='gray')
+    plt.title('Hull'), plt.xticks([]), plt.yticks([])
 
-    # plt.subplot(2, 2, 3), plt.imshow(sobelx, cmap='gray')
-    # plt.title('Sobel X'), plt.xticks([]), plt.yticks([])
-    # plt.subplot(2, 2, 4), plt.imshow(sobely, cmap='gray')
-    # plt.title('Sobel Y'), plt.xticks([]), plt.yticks([])
+    # plt.subplot(1, 2, 1), plt.imshow(laplacian, cmap='gray')
+    # plt.title('Sans filtre'), plt.xticks([]), plt.yticks([])
+    # plt.subplot(1, 2, 2), plt.imshow(low_pass_filter(laplacian), cmap='gray')
+    # plt.title('filtre gaussien'), plt.xticks([]), plt.yticks([])
 
+    # logg = enhance_contrast(pic, method='log')
+    # equal = enhance_contrast(pic, method='equalize')
+    # cla = enhance_contrast(pic, method='clahe')
+
+    # plt.subplot(2, 2, 1), plt.imshow(pic, cmap='gray')
+    # plt.title('Original'), plt.xticks([]), plt.yticks([])
+    # plt.subplot(2, 2, 2), plt.imshow(logg, cmap='gray')
+    # plt.title('Log'), plt.xticks([]), plt.yticks([])
+    # plt.subplot(2, 2, 3), plt.imshow(equal, cmap='gray')
+    # plt.title('histogram equalization'), plt.xticks([]), plt.yticks([])
+    # plt.subplot(2, 2, 4), plt.imshow(cla, cmap='gray')
+    # plt.title('CLAHE'), plt.xticks([]), plt.yticks([])
 
     plt.show()

@@ -8,22 +8,25 @@
 """
 import numpy as np
 import torch
-
+from torch import nn
 from torch.utils.data import random_split, DataLoader
 from DataSet import MPIIDataset
-from ImgUtil import calc_bbox_size
+from DatasetDownloader import ANNO_SAV_DIR
+from ImgUtil import show_img
 import os
 from datetime import datetime
 from copy import deepcopy
-from Models import ResNet
+from Models import ResNet, resnet50
+from tqdm import tqdm, trange
 
-def adjust_learning_rate(optimizer, epoch, drop_stride, frac):
-    lrfac = frac if epoch % drop_stride == 0 else 1
-    for i, param_group in enumerate(optimizer.param_groups):
-        if lrfac != 1:
-            print("Reducing learning rate of group %d from %f to %f" %
-                  (i, param_group['lr'], param_group['lr'] * lrfac))
-        param_group['lr'] *= lrfac
+
+def adjust_learning_rate(optimizer, loss, threshold, frac):
+    if loss < threshold:
+        for i, param_group in enumerate(optimizer.param_groups):
+            if frac != 1:
+                print("Reducing learning rate of group %d from %f to %f" %
+                      (i, param_group['lr'], param_group['lr'] * frac))
+                param_group['lr'] *= frac
 
 
 def run_train(model, optimizer, data_loader, criterion, device, log_interval=10):
@@ -39,19 +42,28 @@ def run_train(model, optimizer, data_loader, criterion, device, log_interval=10)
     """
     model.train()
     total_loss = 0
-    loss = criterion
-    for i, (fields, target), _ in enumerate(data_loader):
+    # loss = criterion
+    epoch_iterator = tqdm(data_loader, desc="Iteration")
+    for i, (fields, target, _, fn)in enumerate(epoch_iterator):
+        meta = (target > 0).float().reshape(-1, model.nJoints, 2).to(device)
+        # show_img(fields[0])
         fields, target = fields.to(device), target.to(device)
+        optimizer.zero_grad()
         y = model(fields)
-        loss = criterion(y, target.float())
-        model.zero_grad()
+        if i % 100 == 0:
+            show_img(fields[0].cpu().squeeze(0), [target[0].cpu().detach().numpy().reshape(-1), y[0].cpu().detach().numpy().reshape(-1)],
+                    include_joints=True)
+        loss = criterion(y.reshape(-1, model.nJoints, 2) * meta, target.float().reshape(-1, model.nJoints, 2) * meta)
+        # model.zero_grad()
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
         if i % log_interval == 0:
-            print('    - loss:', total_loss / log_interval)
+            tqdm.write('    - loss: %.5f' % (total_loss / log_interval))
             total_loss = 0
+    epoch_iterator.close()
     return loss.item()
+
 
 
 def run_test(model, data_loader, device, criterion, alpha=0.5):
@@ -67,15 +79,21 @@ def run_test(model, data_loader, device, criterion, alpha=0.5):
     njoints = 0
     correct = 0
     with torch.no_grad():
-        for quiz, target, headsize in data_loader:
-            target_cpu = deepcopy(target)
-            quiz, target = quiz.to(device), target.to(device)
-            y = model(quiz)
-            loss = criterion(y, target.float())
-            njoints += 1
-            if np.linalg.norm(y.cpu() - target_cpu) <= alpha * headsize:
-                correct += 1
-    return float(correct) / float(njoints), njoints, loss.item()
+        with tqdm(data_loader, desc='test Iteration') as it:
+            for i, (quiz, target, headsize, _) in enumerate(it):
+                target_cpu = deepcopy(target)
+                headsize = headsize.numpy()
+                quiz, target = quiz.to(device), target.to(device)
+                y = model(quiz)
+                loss = criterion(y, target.float())
+                njoints += 1
+                if np.linalg.norm(y.cpu().numpy() - target_cpu.numpy())\
+                        <= alpha * np.sum(headsize):
+                    correct += 1
+                # if i % 300 == 0:
+                show_img(quiz.cpu().squeeze(0), [target_cpu.numpy().reshape(-1), y.cpu().numpy().reshape(-1)], include_joints=True)
+            it.close()
+        return float(correct) / float(njoints), njoints, loss.item()
 
 
 def save_checkpoint(model, path, epoch, optimizer, acc, loss):
@@ -96,6 +114,15 @@ def save_checkpoint(model, path, epoch, optimizer, acc, loss):
                 'acc': acc,
                 'loss': loss,
                 }, path)
+
+
+def single_test(img: torch.Tensor, target: np.ndarray, model: nn.Module, load_dir: str):
+    # ttensor = torch.from_numpy(target)
+    checkpoint = torch.load(load_dir)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    res = model(img)
+    res = res.numpy()
+    show_img(img, [target, res], include_joints=True)
 
 
 def main_process(_model, dataset, sav_dir, epoch, learning_rate, batch_size,
@@ -124,24 +151,26 @@ def main_process(_model, dataset, sav_dir, epoch, learning_rate, batch_size,
     train_dataset, valid_dataset, test_dataset = random_split(
         dataset, (train_length, valid_length, test_length))
     train_data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    valid_data_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    test_data_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    valid_data_loader = DataLoader(valid_dataset, batch_size=1, shuffle=True, num_workers=4, pin_memory=True)
+    test_data_loader = DataLoader(test_dataset, batch_size=1, shuffle=True, num_workers=4, pin_memory=True)
 
     # Prepare the model and loss function
 
     if is_reload and os.path.exists(load_dir):
         checkpoint = torch.load(load_dir)
         _model.load_state_dict(checkpoint['model_state_dict'])
+        # _model.load_state_dict(checkpoint['model_state'])
         _model = _model.to(device)
-        _optimizer = torch.optim.RMSprop(params=_model.parameters(), lr=learning_rate, momentum=momentum)
+        _optimizer = torch.optim.RMSprop(params=_model.parameters(), lr=learning_rate)
         _optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # _optimizer.load_state_dict(checkpoint['optimizer_state'])
         print('Reload model from last epoch %d, loss = %.5f, acc = %.5f%%' %
               (checkpoint['epoch'], checkpoint['loss'], checkpoint['acc'] * 100))
     else:
         if is_reload and not os.path.exists(load_dir):
             print('Model path not found. Start with new model.')
         _model = _model.to(device)
-        _optimizer = torch.optim.RMSprop(params=_model.parameters(), lr=learning_rate, momentum=momentum)
+        _optimizer = torch.optim.RMSprop(params=_model.parameters(), lr=learning_rate)
     _criterion = torch.nn.MSELoss().to(device)
 
     # train
@@ -149,23 +178,30 @@ def main_process(_model, dataset, sav_dir, epoch, learning_rate, batch_size,
     print('Allocated:', round(torch.cuda.memory_allocated(0) / 1024 ** 3, 1), 'GB')
     print('Cached:   ', round(torch.cuda.memory_cached(0) / 1024 ** 3, 1), 'GB')
     if do_train:
-        for epoch_i in range(epoch):
+        print('Train example length: %d, batch size: %d' % (len(train_dataset), batch_size))
+        train_iterator = trange(0, int(epoch), desc="Epoch")
+        for epoch_i in train_iterator:
             train_loss = run_train(_model, _optimizer, train_data_loader, _criterion, device)
-            adjust_learning_rate(_optimizer, epoch_i, drop_stride=2, frac=0.7)
             val_acc, val_total, val_loss = run_test(_model, valid_data_loader, device, _criterion)
+            adjust_learning_rate(_optimizer, val_loss, threshold=1500, frac=0.7)
 
-            print('epoch:', epoch_i, 'train loss:', train_loss)
-            print('validation on %d examples: --- acc: %.5f\n' % (val_total, val_acc))
+            save_checkpoint(_model, sav_dir + '_epoch' + str(epoch_i), epoch_i, _optimizer, val_acc, val_loss)
+            tqdm.write('epoch: %d, train loss: %.5f' % (epoch_i, train_loss))
+            tqdm.write('validation on %d examples: --- acc: %.5f\n' % (val_total, val_acc))
 
     test_acc, test_total, test_loss = run_test(_model, test_data_loader, device, _criterion)
     print('test loss: %.5f' % test_loss)
     print('test acc: %.5f on %d examples' % (test_acc, test_total))
-    save_checkpoint(_model, sav_dir, -1, _optimizer, test_acc, test_loss)
+    if do_train:
+        save_checkpoint(_model, sav_dir, -1, _optimizer, test_acc, test_loss)
+    else:
+        save_checkpoint(_model, load_dir, -1, _optimizer, test_acc, test_loss)
     return _model
 
 
 if __name__ == '__main__':
-    bellepose = ResNet(256)
-    ds = MPIIDataset(256)
-    main_process(bellepose, sav_dir='./resnet50_model',
-                 dataset=ds, epoch=3, learning_rate=2.5e-4, batch_size=20)
+    bellepose = resnet50()
+    ds = MPIIDataset(256, anno_dir=ANNO_SAV_DIR)
+    main_process(bellepose, sav_dir='./resnet50_model_2_color',
+                 dataset=ds, epoch=3, learning_rate=2.5e-4, batch_size=16,
+                 do_train=False, is_reload=True, load_dir='resnet50_model_color_epoch0')
